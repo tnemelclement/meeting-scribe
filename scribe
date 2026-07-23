@@ -6,7 +6,8 @@ Usage :
   scribe                    enregistre (Ctrl-C pour arrêter), transcrit, écrit le .md
   scribe --title standup    nom de la note
   scribe --lang auto        langue (défaut : fr)
-  scribe --model tiny       modèle whisper (défaut : large-v3-turbo)
+  scribe --backend api      moteur : local (whisper.cpp, gratuit) | api (OpenAI) | ask (défaut)
+  scribe --model tiny       modèle whisper local (défaut : large-v3-turbo)
   scribe --redo <dossier>   re-transcrit une session déjà enregistrée
 """
 
@@ -14,15 +15,18 @@ import argparse
 import datetime
 import json
 import os
-import shutil
+import re
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
 SYSCAP = REPO / ".build" / "release" / "syscap"
-WHISPER_CLI = Path("/opt/homebrew/opt/whisper-cpp/bin/whisper-cli")
+WHISPER_CPP = Path("/opt/homebrew/opt/whisper-cpp/bin/whisper-cli")  # transcription locale (Metal)
+WHISPER_API_CLI = Path("/Library/Frameworks/Python.framework/Versions/3.11/bin/whisper-cli")  # backend API OpenAI
+API_ENV_FILE = Path.home() / "dev" / "whisper-cli" / ".env"  # source de la clé OpenAI
 MODEL_DIR = Path.home() / ".cache" / "whisper-cpp"
 MODEL_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 SESSIONS_DIR = Path(os.environ.get("SCRIBE_SESSIONS", Path.home() / "Music" / "scribe"))
@@ -35,6 +39,47 @@ OUT_DIR = Path(os.environ.get(
 def die(msg: str) -> None:
     sys.exit(f"scribe: {msg}")
 
+
+# --------------------------------------------------------------------------- #
+#  Barre de progression (une ligne réécrite en place)                         #
+# --------------------------------------------------------------------------- #
+
+class Progress:
+    """Barre de progression. `fraction` va de 0 à 1 sur l'ensemble des pistes."""
+
+    WIDTH = 30
+
+    def __init__(self, interactive: bool):
+        self.interactive = interactive
+        self.label = ""
+
+    def bar(self, fraction: float) -> None:
+        if not self.interactive:
+            return
+        fraction = max(0.0, min(1.0, fraction))
+        filled = int(fraction * self.WIDTH)
+        rendered = "█" * filled + "·" * (self.WIDTH - filled)
+        print(f"\r  {self.label} [{rendered}] {int(fraction * 100):3d}%  ", end="", flush=True)
+
+    def spin(self, base: float, span: float, tick: int) -> None:
+        """Barre indéterminée : un bloc qui rebondit (backend API, pas de %)."""
+        if not self.interactive:
+            return
+        pos = tick % (2 * (self.WIDTH - 1))
+        if pos >= self.WIDTH:
+            pos = 2 * (self.WIDTH - 1) - pos
+        cells = ["·"] * self.WIDTH
+        cells[pos] = "█"
+        print(f"\r  {self.label} [{''.join(cells)}]  API…  ", end="", flush=True)
+
+    def done(self) -> None:
+        if self.interactive:
+            print()
+
+
+# --------------------------------------------------------------------------- #
+#  Modèle local + resampling                                                   #
+# --------------------------------------------------------------------------- #
 
 def ensure_model(name: str) -> Path:
     model = MODEL_DIR / f"ggml-{name}.bin"
@@ -49,6 +94,99 @@ def ensure_model(name: str) -> Path:
     return model
 
 
+def resample_16k(wav: Path) -> Path:
+    """16 kHz mono 16 bits : requis par whisper.cpp, et réduit fortement l'upload API."""
+    out = wav.with_name(wav.stem + "-16k.wav")
+    subprocess.run(
+        ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(wav), str(out)],
+        check=True, capture_output=True,
+    )
+    return out
+
+
+# --------------------------------------------------------------------------- #
+#  Backends de transcription → renvoient des segments [{ms, text}]            #
+# --------------------------------------------------------------------------- #
+
+def transcribe_local(wav: Path, model: Path, lang: str,
+                     progress: Progress, base: float, span: float) -> list[dict]:
+    wav16k = resample_16k(wav)
+    out_prefix = wav.with_suffix("")
+    proc = subprocess.Popen(
+        [str(WHISPER_CPP), "-m", str(model), "-l", lang, "-oj", "-of", str(out_prefix),
+         "-pp", "-np", "-f", str(wav16k)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    for line in proc.stderr:  # whisper.cpp écrit « progress = N% » sur stderr
+        m = re.search(r"progress\s*=\s*(\d+)%", line)
+        if m:
+            progress.bar(base + span * int(m.group(1)) / 100)
+    proc.wait()
+    if proc.returncode != 0:
+        die(f"whisper.cpp a échoué (code {proc.returncode})")
+    progress.bar(base + span)
+    data = json.loads(out_prefix.with_suffix(".json").read_text())
+    return [
+        {"ms": seg["offsets"]["from"], "text": seg["text"].strip()}
+        for seg in data.get("transcription", []) if seg["text"].strip()
+    ]
+
+
+def api_key() -> str:
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key and API_ENV_FILE.exists():
+        for line in API_ENV_FILE.read_text().splitlines():
+            if line.startswith("OPENAI_API_KEY="):
+                key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    if not key:
+        die(f"clé OpenAI introuvable — définir OPENAI_API_KEY ou la mettre dans {API_ENV_FILE}")
+    return key
+
+
+def transcribe_api(wav: Path, lang: str,
+                   progress: Progress, base: float, span: float) -> list[dict]:
+    wav16k = resample_16k(wav)  # réduit l'upload (l'API découpe au-delà de 25 Mo)
+    srt = wav.with_suffix(".srt")
+    env = {**os.environ, "OPENAI_API_KEY": api_key()}
+    proc = subprocess.Popen(
+        [str(WHISPER_API_CLI), "transcribe", str(wav16k), "-b", "openai",
+         "-l", lang, "--timestamps", "-f", "srt", "-o", str(srt)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env,
+    )
+    tick = 0
+    while proc.poll() is None:  # l'API n'expose pas de %, on anime pendant l'appel
+        progress.spin(base, span, tick)
+        tick += 1
+        time.sleep(0.15)
+    err = proc.stderr.read()
+    if proc.returncode != 0:
+        die(f"backend API a échoué : {err.strip()}")
+    progress.bar(base + span)
+    return parse_srt(srt)
+
+
+def parse_srt(path: Path) -> list[dict]:
+    segments = []
+    for block in path.read_text().strip().split("\n\n"):
+        lines = block.splitlines()
+        if len(lines) < 3:
+            continue
+        start = lines[1].split(" -->")[0].strip()
+        m = re.match(r"(\d+):(\d+):(\d+)[,.](\d+)", start)
+        if not m:
+            continue
+        h, mn, s, ms = (int(x) for x in m.groups())
+        text = " ".join(lines[2:]).strip()
+        if text:
+            segments.append({"ms": ((h * 60 + mn) * 60 + s) * 1000 + ms, "text": text})
+    return segments
+
+
+# --------------------------------------------------------------------------- #
+#  Enregistrement + sortie markdown                                           #
+# --------------------------------------------------------------------------- #
+
 def record(session: Path) -> None:
     session.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen([str(SYSCAP), str(session / "system.wav"), str(session / "mic.wav")])
@@ -61,31 +199,8 @@ def record(session: Path) -> None:
         die(f"syscap a échoué (code {proc.returncode})")
 
 
-def transcribe(wav: Path, model: Path, lang: str) -> list[dict]:
-    """Transcrit un wav et renvoie les segments [{ms, text}]."""
-    wav16k = wav.with_name(wav.stem + "-16k.wav")
-    # afconvert est fourni par macOS : resample 16 kHz mono 16 bits pour whisper.cpp
-    subprocess.run(
-        ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(wav), str(wav16k)],
-        check=True, capture_output=True,
-    )
-    out_prefix = wav.with_suffix("")
-    subprocess.run(
-        [str(WHISPER_CLI), "-m", str(model), "-l", lang, "-oj", "-of", str(out_prefix),
-         "-np", "-f", str(wav16k)],
-        check=True, capture_output=True,
-    )
-    data = json.loads(out_prefix.with_suffix(".json").read_text())
-    segments = []
-    for seg in data.get("transcription", []):
-        text = seg["text"].strip()
-        if text:
-            segments.append({"ms": seg["offsets"]["from"], "text": text})
-    return segments
-
-
 def write_markdown(session: Path, title: str, stamp: datetime.datetime,
-                   mine: list[dict], theirs: list[dict]) -> Path:
+                   backend: str, mine: list[dict], theirs: list[dict]) -> Path:
     merged = sorted(
         [{**s, "who": "Moi"} for s in mine] + [{**s, "who": "Eux"} for s in theirs],
         key=lambda s: s["ms"],
@@ -97,23 +212,33 @@ def write_markdown(session: Path, title: str, stamp: datetime.datetime,
         minutes, seconds = divmod(seg["ms"] // 1000, 60)
         lines.append(f"**[{minutes:02d}:{seconds:02d}] {seg['who']} :** {seg['text']}")
         lines.append("")
-    lines += ["---", f"Audio : `{session}`", "", "#reunion #transcription"]
+    lines += ["---", f"Audio : `{session}` · transcription : {backend}", "", "#reunion #transcription"]
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUT_DIR / f"{stamp:%Y-%m-%d_%H%M}_{title}.md"
     out.write_text("\n".join(lines))
     return out
 
 
+def choose_backend(requested: str) -> str:
+    if requested in ("local", "api"):
+        return requested
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        answer = input("Transcription — [l]ocal (gratuit) ou [a]pi OpenAI (~0,72 $/h) ? [L/a] ")
+        return "api" if answer.strip().lower().startswith("a") else "local"
+    return "local"  # non interactif : local par défaut
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="scribe", description=__doc__)
     parser.add_argument("--title", default="reunion")
     parser.add_argument("--lang", default="fr")
+    parser.add_argument("--backend", choices=["local", "api", "ask"], default="ask")
     parser.add_argument("--model", default="large-v3-turbo")
     parser.add_argument("--redo", metavar="DOSSIER", help="re-transcrit une session existante")
     args = parser.parse_args()
 
-    if not WHISPER_CLI.exists():
-        die("whisper-cli introuvable — brew install whisper-cpp")
+    if not WHISPER_CPP.exists():
+        die("whisper-cli (local) introuvable — brew install whisper-cpp")
     if not SYSCAP.exists() and not args.redo:
         die("syscap non compilé — lancer : swift build -c release")
 
@@ -126,12 +251,25 @@ def main() -> None:
         session = SESSIONS_DIR / f"{stamp:%Y-%m-%d_%H%M%S}"
         record(session)
 
-    model = ensure_model(args.model)
-    print("scribe: transcription en cours…")
-    theirs = transcribe(session / "system.wav", model, args.lang)
-    mine = transcribe(session / "mic.wav", model, args.lang)
+    backend = choose_backend(args.backend)
+    progress = Progress(interactive=sys.stdout.isatty())
 
-    out = write_markdown(session, args.title, stamp, mine, theirs)
+    # Les deux pistes se partagent la barre à parts égales : Eux [0, 0.5], Moi [0.5, 1]
+    progress.label = "Eux"
+    if backend == "api":
+        theirs = transcribe_api(session / "system.wav", args.lang, progress, 0.0, 0.5)
+    else:
+        model = ensure_model(args.model)
+        theirs = transcribe_local(session / "system.wav", model, args.lang, progress, 0.0, 0.5)
+
+    progress.label = "Moi"
+    if backend == "api":
+        mine = transcribe_api(session / "mic.wav", args.lang, progress, 0.5, 0.5)
+    else:
+        mine = transcribe_local(session / "mic.wav", model, args.lang, progress, 0.5, 0.5)
+    progress.done()
+
+    out = write_markdown(session, args.title, stamp, backend, mine, theirs)
     print(f"scribe: transcription écrite → {out}")
 
 

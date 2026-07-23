@@ -44,8 +44,22 @@ Pendant l'enregistrement, un VU-mètre confirme que les deux pistes captent :
 ./scribe                          # enregistre, Ctrl-C pour arrêter → transcrit → écrit le .md
 ./scribe --title standup          # nom de la note
 ./scribe --lang auto              # langue (défaut : fr)
-./scribe --model tiny             # modèle whisper (défaut : large-v3-turbo, téléchargé au 1er usage)
+./scribe --backend local          # moteur : local | api | ask (défaut : demande à l'arrêt)
+./scribe --model tiny             # modèle whisper local (défaut : large-v3-turbo, téléchargé au 1er usage)
 ./scribe --redo <dossier>         # re-transcrit une session déjà enregistrée
+```
+
+### Choix du moteur de transcription
+
+À l'arrêt de l'enregistrement, `scribe` demande comment transcrire (sauf si `--backend` est passé) :
+
+- **local** — [whisper.cpp](https://github.com/ggerganov/whisper.cpp) sur le GPU Metal, modèle `large-v3-turbo`. Gratuit, hors-ligne, privé. ~20-30× temps réel sur Apple Silicon. **Recommandé.**
+- **api** — API Whisper d'OpenAI (`whisper-1`). Un peu plus précis sur certains audios, mais ~0,72 $/h de réunion (deux pistes) et l'audio quitte la machine. La clé est lue depuis `OPENAI_API_KEY` ou `~/dev/whisper-cli/.env`.
+
+Une barre de progression suit l'avancement des deux pistes (« Eux » puis « Moi ») :
+
+```
+  Moi [███████████████···············]  52%
 ```
 
 Variables d'environnement :
@@ -58,7 +72,7 @@ Variables d'environnement :
 ## Comment ça marche
 
 1. `syscap` (Swift) crée un Core Audio Process Tap global + un aggregate device privé, et enregistre deux WAV : `system.wav` (sortie audio = les autres) et `mic.wav` (vous). Pas de driver, pas de BlackHole.
-2. `scribe` (Python, stdlib uniquement) resample en 16 kHz mono avec `afconvert` (fourni par macOS), transcrit les deux pistes avec `whisper-cli`, fusionne les segments par timestamp et écrit le markdown.
+2. `scribe` (Python, stdlib uniquement) resample en 16 kHz mono avec `afconvert` (fourni par macOS), transcrit les deux pistes avec le moteur choisi (whisper.cpp local, ou l'API OpenAI via le CLI [whisper-cli](https://github.com/tnemelclement/whisper-cli)), fusionne les segments par timestamp et écrit le markdown.
 
 ## Limites connues
 
