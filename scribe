@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""scribe — enregistre une réunion (audio système + micro) et écrit la
+transcription en markdown dans le vault Obsidian.
+
+Usage :
+  scribe                    enregistre (Ctrl-C pour arrêter), transcrit, écrit le .md
+  scribe --title standup    nom de la note
+  scribe --lang auto        langue (défaut : fr)
+  scribe --model tiny       modèle whisper (défaut : large-v3-turbo)
+  scribe --redo <dossier>   re-transcrit une session déjà enregistrée
+"""
+
+import argparse
+import datetime
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent
+SYSCAP = REPO / ".build" / "release" / "syscap"
+WHISPER_CLI = Path("/opt/homebrew/opt/whisper-cpp/bin/whisper-cli")
+MODEL_DIR = Path.home() / ".cache" / "whisper-cpp"
+MODEL_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+SESSIONS_DIR = Path(os.environ.get("SCRIBE_SESSIONS", Path.home() / "Music" / "scribe"))
+OUT_DIR = Path(os.environ.get(
+    "SCRIBE_OUT",
+    Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Clements_Brain/0_INBOX",
+))
+
+
+def die(msg: str) -> None:
+    sys.exit(f"scribe: {msg}")
+
+
+def ensure_model(name: str) -> Path:
+    model = MODEL_DIR / f"ggml-{name}.bin"
+    if model.exists():
+        return model
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    url = f"{MODEL_BASE_URL}/ggml-{name}.bin"
+    print(f"scribe: téléchargement du modèle {name}…")
+    tmp = model.with_suffix(".part")
+    subprocess.run(["curl", "-L", "--fail", "--progress-bar", "-o", str(tmp), url], check=True)
+    tmp.rename(model)
+    return model
+
+
+def record(session: Path) -> None:
+    session.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen([str(SYSCAP), str(session / "system.wav"), str(session / "mic.wav")])
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        proc.wait()
+    if proc.returncode not in (0, None):
+        die(f"syscap a échoué (code {proc.returncode})")
+
+
+def transcribe(wav: Path, model: Path, lang: str) -> list[dict]:
+    """Transcrit un wav et renvoie les segments [{ms, text}]."""
+    wav16k = wav.with_name(wav.stem + "-16k.wav")
+    # afconvert est fourni par macOS : resample 16 kHz mono 16 bits pour whisper.cpp
+    subprocess.run(
+        ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(wav), str(wav16k)],
+        check=True, capture_output=True,
+    )
+    out_prefix = wav.with_suffix("")
+    subprocess.run(
+        [str(WHISPER_CLI), "-m", str(model), "-l", lang, "-oj", "-of", str(out_prefix),
+         "-np", "-f", str(wav16k)],
+        check=True, capture_output=True,
+    )
+    data = json.loads(out_prefix.with_suffix(".json").read_text())
+    segments = []
+    for seg in data.get("transcription", []):
+        text = seg["text"].strip()
+        if text:
+            segments.append({"ms": seg["offsets"]["from"], "text": text})
+    return segments
+
+
+def write_markdown(session: Path, title: str, stamp: datetime.datetime,
+                   mine: list[dict], theirs: list[dict]) -> Path:
+    merged = sorted(
+        [{**s, "who": "Moi"} for s in mine] + [{**s, "who": "Eux"} for s in theirs],
+        key=lambda s: s["ms"],
+    )
+    lines = [f"# Réunion — {title} ({stamp:%Y-%m-%d %H:%M})", ""]
+    if not merged:
+        lines.append("*(aucune parole détectée)*")
+    for seg in merged:
+        minutes, seconds = divmod(seg["ms"] // 1000, 60)
+        lines.append(f"**[{minutes:02d}:{seconds:02d}] {seg['who']} :** {seg['text']}")
+        lines.append("")
+    lines += ["---", f"Audio : `{session}`", "", "#reunion #transcription"]
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out = OUT_DIR / f"{stamp:%Y-%m-%d_%H%M}_{title}.md"
+    out.write_text("\n".join(lines))
+    return out
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="scribe", description=__doc__)
+    parser.add_argument("--title", default="reunion")
+    parser.add_argument("--lang", default="fr")
+    parser.add_argument("--model", default="large-v3-turbo")
+    parser.add_argument("--redo", metavar="DOSSIER", help="re-transcrit une session existante")
+    args = parser.parse_args()
+
+    if not WHISPER_CLI.exists():
+        die("whisper-cli introuvable — brew install whisper-cpp")
+    if not SYSCAP.exists() and not args.redo:
+        die("syscap non compilé — lancer : swift build -c release")
+
+    stamp = datetime.datetime.now()
+    if args.redo:
+        session = Path(args.redo).expanduser()
+        if not (session / "system.wav").exists():
+            die(f"pas de system.wav dans {session}")
+    else:
+        session = SESSIONS_DIR / f"{stamp:%Y-%m-%d_%H%M%S}"
+        record(session)
+
+    model = ensure_model(args.model)
+    print("scribe: transcription en cours…")
+    theirs = transcribe(session / "system.wav", model, args.lang)
+    mine = transcribe(session / "mic.wav", model, args.lang)
+
+    out = write_markdown(session, args.title, stamp, mine, theirs)
+    print(f"scribe: transcription écrite → {out}")
+
+
+if __name__ == "__main__":
+    main()
