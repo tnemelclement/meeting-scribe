@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.clementmouly.syscap</string>
+	<key>CFBundleName</key>
+	<string>syscap</string>
+	<key>CFBundleExecutable</key>
+	<string>syscap</string>
+	<key>CFBundleVersion</key>
+	<string>1.0</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Enregistre l'audio de vos réunions pour en produire la transcription.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Enregistre votre voix pour en produire la transcription.</string>
+</dict>
+</plist>

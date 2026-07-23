@@ -20,9 +20,25 @@ cd meeting-scribe
 swift build -c release
 ```
 
-Au premier lancement, macOS demandera deux permissions au terminal : **Micro** et **Enregistrement de l'audio système**.
+### Permissions (à faire une fois)
+
+Au premier lancement, macOS demande deux permissions **au terminal depuis lequel vous lancez la commande** : *Microphone* et *Enregistrement audio*.
+
+⚠️ Piège important : quand la permission d'enregistrement audio manque, macOS **ne renvoie pas d'erreur** — le tap livre du silence, et vous obtenez un fichier de la bonne durée entièrement vide. Le VU-mètre affiché pendant l'enregistrement sert justement à repérer ça immédiatement, et `syscap` prévient à l'arrêt si une piste est restée muette.
+
+Lancez le premier enregistrement depuis un terminal interactif (Terminal.app, iTerm) pour que le prompt puisse s'afficher. Si aucun prompt n'apparaît, ajoutez votre terminal à la main :
+
+```sh
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
+```
 
 ## Usage
+
+Pendant l'enregistrement, un VU-mètre confirme que les deux pistes captent :
+
+```
+  02:34   Moi ███████·············   Eux ██████████··········
+```
 
 ```sh
 ./scribe                          # enregistre, Ctrl-C pour arrêter → transcrit → écrit le .md

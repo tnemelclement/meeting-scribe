@@ -2,6 +2,7 @@
 // sur deux fichiers WAV séparés. Arrêt propre sur SIGINT/SIGTERM.
 // Usage : syscap <system.wav> <mic.wav>
 
+import Accelerate
 import AudioToolbox
 import AVFoundation
 import Foundation
@@ -73,22 +74,34 @@ var systemFile: AVAudioFile? = try? AVAudioFile(
     commonFormat: tapFormat.commonFormat, interleaved: tapFormat.isInterleaved)
 guard systemFile != nil else { fail("impossible de créer \(systemURL.path)") }
 
+/// Amplitude crête d'un buffer, pour le VU-mètre.
+func peak(of buffer: AVAudioPCMBuffer) -> Float {
+    guard let data = buffer.floatChannelData else { return 0 }
+    let frames = vDSP_Length(buffer.frameLength)
+    var result: Float = 0
+    if buffer.format.isInterleaved {
+        vDSP_maxmgv(data[0], 1, &result, frames * vDSP_Length(buffer.format.channelCount))
+    } else {
+        for channel in 0..<Int(buffer.format.channelCount) {
+            var channelPeak: Float = 0
+            vDSP_maxmgv(data[channel], 1, &channelPeak, frames)
+            result = max(result, channelPeak)
+        }
+    }
+    return result
+}
+
+// ponytail: Float non synchronisé entre thread audio et main — bénin pour un VU-mètre
+var systemPeak: Float = 0
+var micPeak: Float = 0
+
 // ponytail: AVAudioEngine ne sait pas lire un aggregate contenant un tap → IOProc bas niveau obligatoire
-let debug = ProcessInfo.processInfo.environment["SYSCAP_DEBUG"] != nil
-var callbackCount = 0
 var ioProcID: AudioDeviceIOProcID?
 check(AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggID, nil) { _, inInputData, _, _, _ in
-    if debug && callbackCount < 3 {
-        callbackCount += 1
-        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
-        FileHandle.standardError.write(Data("syscap[debug]: callback \(callbackCount), \(abl.count) buffers, bytes=\(abl.map { $0.mDataByteSize })\n".utf8))
-    }
     guard let file = systemFile,
           let buffer = AVAudioPCMBuffer(pcmFormat: tapFormat, bufferListNoCopy: inInputData, deallocator: nil)
-    else {
-        if debug { FileHandle.standardError.write(Data("syscap[debug]: buffer nil\n".utf8)) }
-        return
-    }
+    else { return }
+    systemPeak = max(systemPeak, peak(of: buffer))
     try? file.write(from: buffer)
 }, "création de l'IO proc")
 check(AudioDeviceStart(aggID, ioProcID), "démarrage de la capture système")
@@ -99,11 +112,43 @@ let micFormat = engine.inputNode.outputFormat(forBus: 0)
 var micFile: AVAudioFile? = try? AVAudioFile(forWriting: micURL, settings: micFormat.settings)
 guard micFile != nil else { fail("impossible de créer \(micURL.path)") }
 engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { buffer, _ in
+    micPeak = max(micPeak, peak(of: buffer))
     try? micFile?.write(from: buffer)
 }
 do { try engine.start() } catch { fail("démarrage du micro : \(error.localizedDescription)") }
 
+// --- VU-mètre : une ligne réécrite en place, pour vérifier d'un coup d'œil que ça capte
+let startedAt = Date()
+var micDisplay: Float = 0
+var systemDisplay: Float = 0
+var micEverHeard = false
+var systemEverHeard = false
+
+func meter(_ level: Float) -> String {
+    let decibels = level > 0.0001 ? 20 * log10(level) : -60
+    let filled = Int((max(-60, decibels) + 60) / 60 * 20)
+    return String(repeating: "█", count: filled) + String(repeating: "·", count: 20 - filled)
+}
+
+func refreshMeter() {
+    let mic = micPeak, system = systemPeak
+    micPeak = 0
+    systemPeak = 0
+    if mic > 0.003 { micEverHeard = true }
+    if system > 0.003 { systemEverHeard = true }
+    // retombée progressive, sinon la barre clignote sur chaque syllabe
+    micDisplay = max(mic, micDisplay * 0.75)
+    systemDisplay = max(system, systemDisplay * 0.75)
+    guard interactive else { return } // sortie redirigée : on suit les niveaux sans afficher
+    let elapsed = Int(Date().timeIntervalSince(startedAt))
+    let clock = String(format: "%02d:%02d", elapsed / 60, elapsed % 60)
+    print("\r  \(clock)   Moi \(meter(micDisplay))   Eux \(meter(systemDisplay))  ", terminator: "")
+    fflush(stdout)
+}
+
+let interactive = isatty(STDOUT_FILENO) == 1
 print("syscap: enregistrement en cours (Ctrl-C pour arrêter)")
+Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in refreshMeter() }
 
 // --- Arrêt propre : stopper les captures PUIS fermer les fichiers (le header WAV
 // n'est finalisé qu'à la libération des AVAudioFile)
@@ -119,6 +164,17 @@ func shutdown() {
     usleep(100_000) // laisse finir les derniers callbacks avant de fermer les fichiers
     systemFile = nil
     micFile = nil
+    if interactive { print("") } // laisse la ligne du VU-mètre intacte
+    if !micEverHeard {
+        print("syscap: ⚠️  aucun son capté sur le micro")
+        print("         → Réglages Système > Confidentialité et sécurité > Microphone : autoriser votre terminal")
+    }
+    if !systemEverHeard {
+        print("syscap: ⚠️  aucun son capté sur l'audio système (le tap ne renvoie que du silence)")
+        print("         → Réglages Système > Confidentialité et sécurité > Enregistrement audio : autoriser votre terminal")
+        print("         macOS livre du silence sans erreur quand la permission manque.")
+        print("         Le prompt n'apparaît que depuis un terminal interactif (Terminal.app, iTerm…).")
+    }
     print("syscap: arrêt, fichiers écrits")
     exit(0)
 }
