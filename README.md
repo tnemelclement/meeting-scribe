@@ -22,15 +22,18 @@ swift build -c release
 
 ### Permissions (à faire une fois)
 
-Au premier lancement, macOS demande deux permissions **au terminal depuis lequel vous lancez la commande** : *Microphone* et *Enregistrement audio*.
+`syscap` a besoin de deux permissions, accordées **au terminal depuis lequel vous lancez la commande** :
 
-⚠️ Piège important : quand la permission d'enregistrement audio manque, macOS **ne renvoie pas d'erreur** — le tap livre du silence, et vous obtenez un fichier de la bonne durée entièrement vide. Le VU-mètre affiché pendant l'enregistrement sert justement à repérer ça immédiatement, et `syscap` prévient à l'arrêt si une piste est restée muette.
+- **Microphone** — pour votre voix (piste « Moi »).
+- **Enregistrement de l'écran et de l'audio système** — pour l'audio des autres participants (piste « Eux »). C'est [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) qui capte le son système ; la permission est la même que pour une capture d'écran.
 
-Lancez le premier enregistrement depuis un terminal interactif (Terminal.app, iTerm) pour que le prompt puisse s'afficher. Si aucun prompt n'apparaît, ajoutez votre terminal à la main :
+Au premier lancement, macOS affiche le prompt d'enregistrement d'écran. Si la permission est refusée ou absente, `syscap` s'arrête immédiatement avec les étapes à suivre (il n'enregistre jamais du silence en douce). Pour l'accorder à la main :
 
 ```sh
-open "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
 ```
+
+Cochez votre terminal (Terminal, iTerm…), **quittez-le et relancez-le**, puis réessayez. Le VU-mètre pendant l'enregistrement confirme que les deux pistes captent.
 
 ## Usage
 
@@ -71,7 +74,7 @@ Variables d'environnement :
 
 ## Comment ça marche
 
-1. `syscap` (Swift) crée un Core Audio Process Tap global + un aggregate device privé, et enregistre deux WAV : `system.wav` (sortie audio = les autres) et `mic.wav` (vous). Pas de driver, pas de BlackHole.
+1. `syscap` (Swift) capte l'audio système via ScreenCaptureKit (16 kHz mono) et le micro via AVAudioEngine, et enregistre deux WAV : `system.wav` (les autres) et `mic.wav` (vous). Pas de driver, pas de BlackHole, pas de bot dans la réunion.
 2. `scribe` (Python, stdlib uniquement) resample en 16 kHz mono avec `afconvert` (fourni par macOS), transcrit les deux pistes avec le moteur choisi (whisper.cpp local, ou l'API OpenAI via le CLI [whisper-cli](https://github.com/tnemelclement/whisper-cli)), fusionne les segments par timestamp et écrit le markdown.
 
 ## Limites connues

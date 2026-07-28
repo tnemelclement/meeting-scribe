@@ -1,78 +1,28 @@
-// syscap — capture l'audio système (Core Audio Process Tap) et le micro
+// syscap — capture l'audio système (ScreenCaptureKit) et le micro (AVAudioEngine)
 // sur deux fichiers WAV séparés. Arrêt propre sur SIGINT/SIGTERM.
 // Usage : syscap <system.wav> <mic.wav>
+//
+// ScreenCaptureKit plutôt qu'un Core Audio process tap : la permission
+// « Enregistrement de l'écran et de l'audio système » (kTCCServiceScreenCapture)
+// est réellement cochable dans les Réglages Système et déclenche un vrai prompt,
+// contrairement au service kTCCServiceAudioCapture des taps qui renvoie du
+// silence sans jamais laisser l'utilisateur l'autoriser.
 
 import Accelerate
-import AudioToolbox
 import AVFoundation
 import Foundation
+import ScreenCaptureKit
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data("syscap: \(message)\n".utf8))
     exit(1)
 }
 
-func check(_ status: OSStatus, _ what: String) {
-    guard status == noErr else { fail("\(what) (OSStatus \(status))") }
-}
-
 let args = CommandLine.arguments
 guard args.count == 3 else { fail("usage: syscap <system.wav> <mic.wav>") }
 let systemURL = URL(fileURLWithPath: args[1])
 let micURL = URL(fileURLWithPath: args[2])
-
-// --- Tap global sur l'audio système (macOS 14.2+, permission TCC dédiée en 14.4+)
-let tapDesc = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
-tapDesc.uuid = UUID()
-tapDesc.muteBehavior = .unmuted
-tapDesc.isPrivate = true
-
-var tapID = AudioObjectID(kAudioObjectUnknown)
-check(AudioHardwareCreateProcessTap(tapDesc, &tapID), "création du tap système — vérifier la permission « Enregistrement de l'audio système » du terminal")
-
-// UID du périphérique de sortie par défaut (requis comme sous-device de l'aggregate)
-var defaultOutputID = AudioDeviceID(0)
-var propSize = UInt32(MemoryLayout<AudioDeviceID>.size)
-var address = AudioObjectPropertyAddress(
-    mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-    mScope: kAudioObjectPropertyScopeGlobal,
-    mElement: kAudioObjectPropertyElementMain)
-check(AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &propSize, &defaultOutputID), "lecture du périphérique de sortie")
-
-var outputUID: CFString = "" as CFString
-propSize = UInt32(MemoryLayout<CFString>.size)
-address.mSelector = kAudioDevicePropertyDeviceUID
-check(AudioObjectGetPropertyData(defaultOutputID, &address, 0, nil, &propSize, &outputUID), "lecture de l'UID de sortie")
-
-// Aggregate device privé : sortie par défaut + le tap (avec compensation de dérive)
-let aggDescription: [String: Any] = [
-    kAudioAggregateDeviceNameKey: "syscap",
-    kAudioAggregateDeviceUIDKey: UUID().uuidString,
-    kAudioAggregateDeviceMainSubDeviceKey: outputUID,
-    kAudioAggregateDeviceIsPrivateKey: true,
-    kAudioAggregateDeviceIsStackedKey: false,
-    kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outputUID]],
-    kAudioAggregateDeviceTapListKey: [[
-        kAudioSubTapUIDKey: tapDesc.uuid.uuidString,
-        kAudioSubTapDriftCompensationKey: true,
-    ]],
-    kAudioAggregateDeviceTapAutoStartKey: true,
-]
-var aggID = AudioObjectID(kAudioObjectUnknown)
-check(AudioHardwareCreateAggregateDevice(aggDescription as CFDictionary, &aggID), "création de l'aggregate device")
-
-// Format du tap → fichier WAV système
-var asbd = AudioStreamBasicDescription()
-propSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-address.mSelector = kAudioTapPropertyFormat
-check(AudioObjectGetPropertyData(tapID, &address, 0, nil, &propSize, &asbd), "lecture du format du tap")
-guard let tapFormat = AVAudioFormat(streamDescription: &asbd) else { fail("format du tap invalide") }
-
-// commonFormat/interleaved doivent matcher le buffer du tap, sinon write() échoue
-var systemFile: AVAudioFile? = try? AVAudioFile(
-    forWriting: systemURL, settings: tapFormat.settings,
-    commonFormat: tapFormat.commonFormat, interleaved: tapFormat.isInterleaved)
-guard systemFile != nil else { fail("impossible de créer \(systemURL.path)") }
+let interactive = isatty(STDOUT_FILENO) == 1
 
 /// Amplitude crête d'un buffer, pour le VU-mètre.
 func peak(of buffer: AVAudioPCMBuffer) -> Float {
@@ -91,33 +41,127 @@ func peak(of buffer: AVAudioPCMBuffer) -> Float {
     return result
 }
 
-// ponytail: Float non synchronisé entre thread audio et main — bénin pour un VU-mètre
-var systemPeak: Float = 0
-var micPeak: Float = 0
+// ponytail: Float non synchronisé entre threads audio et main — bénin pour un VU-mètre
+final class Levels: @unchecked Sendable {
+    var system: Float = 0
+    var mic: Float = 0
+}
+let levels = Levels()
 
-// ponytail: AVAudioEngine ne sait pas lire un aggregate contenant un tap → IOProc bas niveau obligatoire
-var ioProcID: AudioDeviceIOProcID?
-check(AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggID, nil) { _, inInputData, _, _, _ in
-    guard let file = systemFile,
-          let buffer = AVAudioPCMBuffer(pcmFormat: tapFormat, bufferListNoCopy: inInputData, deallocator: nil)
-    else { return }
-    systemPeak = max(systemPeak, peak(of: buffer))
-    try? file.write(from: buffer)
-}, "création de l'IO proc")
-check(AudioDeviceStart(aggID, ioProcID), "démarrage de la capture système")
+// --------------------------------------------------------------------------- #
+//  Capture audio système via ScreenCaptureKit                                 #
+// --------------------------------------------------------------------------- #
 
-// --- Micro via AVAudioEngine (déclenche le prompt TCC micro au premier lancement)
+final class SystemCapture: NSObject, SCStreamOutput, SCStreamDelegate {
+    private let url: URL
+    private var file: AVAudioFile?
+
+    init(url: URL) { self.url = url }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .audio,
+              sampleBuffer.isValid,
+              let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+        let format = AVAudioFormat(cmAudioFormatDescription: formatDesc)
+
+        let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard frames > 0, let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+        pcm.frameLength = frames
+
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer, at: 0, frameCount: Int32(frames), into: pcm.mutableAudioBufferList)
+        guard status == noErr else { return }
+
+        if file == nil {
+            // WAV Int16 : petit fichier, directement lisible par whisper.cpp
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: format.sampleRate,
+                AVNumberOfChannelsKey: format.channelCount,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+            ]
+            file = try? AVAudioFile(forWriting: url, settings: settings,
+                                    commonFormat: format.commonFormat, interleaved: format.isInterleaved)
+        }
+        levels.system = max(levels.system, peak(of: pcm))
+        try? file?.write(from: pcm)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        fail("capture système interrompue : \(error.localizedDescription)")
+    }
+
+    func close() { file = nil }
+}
+
+let systemCapture = SystemCapture(url: systemURL)
+var scStream: SCStream?
+
+// SCShareableContent est asynchrone : on attend le premier écran (déclenche le prompt TCC).
+let ready = DispatchSemaphore(value: 0)
+SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { content, error in
+    guard let display = content?.displays.first else {
+        FileHandle.standardError.write(Data("""
+        syscap: permission « Enregistrement de l'écran et de l'audio système » manquante.
+                (\(error?.localizedDescription ?? "écran inaccessible"))
+
+                1. Réglages Système > Confidentialité et sécurité > Enregistrement de l'écran
+                   et de l'audio système
+                2. Activez votre terminal (Terminal, iTerm, cmux…)
+                3. Quittez et relancez le terminal, puis réessayez.
+
+                Ouvrir le réglage : open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+
+        """.utf8))
+        exit(2)
+    }
+    let config = SCStreamConfiguration()
+    config.capturesAudio = true
+    config.excludesCurrentProcessAudio = true // ne pas capter notre propre sortie
+    config.sampleRate = 16_000               // mono 16 kHz : prêt pour whisper, fichier léger
+    config.channelCount = 1
+    config.width = 2                          // vidéo réduite au minimum (SCStream l'exige)
+    config.height = 2
+    config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+
+    let filter = SCContentFilter(display: display, excludingWindows: [])
+    let stream = SCStream(filter: filter, configuration: config, delegate: systemCapture)
+    do {
+        try stream.addStreamOutput(systemCapture, type: .audio,
+                                   sampleHandlerQueue: DispatchQueue(label: "syscap.audio"))
+    } catch {
+        fail("ajout de la sortie audio : \(error.localizedDescription)")
+    }
+    stream.startCapture { error in
+        if let error { fail("démarrage de la capture système : \(error.localizedDescription)") }
+    }
+    scStream = stream
+    ready.signal()
+}
+if ready.wait(timeout: .now() + 10) == .timedOut {
+    fail("délai dépassé pour l'accès à l'écran — permission « Enregistrement de l'écran » probablement refusée")
+}
+
+// --------------------------------------------------------------------------- #
+//  Capture micro via AVAudioEngine (prompt TCC micro au 1er lancement)        #
+// --------------------------------------------------------------------------- #
+
 let engine = AVAudioEngine()
 let micFormat = engine.inputNode.outputFormat(forBus: 0)
 var micFile: AVAudioFile? = try? AVAudioFile(forWriting: micURL, settings: micFormat.settings)
 guard micFile != nil else { fail("impossible de créer \(micURL.path)") }
 engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { buffer, _ in
-    micPeak = max(micPeak, peak(of: buffer))
+    levels.mic = max(levels.mic, peak(of: buffer))
     try? micFile?.write(from: buffer)
 }
 do { try engine.start() } catch { fail("démarrage du micro : \(error.localizedDescription)") }
 
-// --- VU-mètre : une ligne réécrite en place, pour vérifier d'un coup d'œil que ça capte
+// --------------------------------------------------------------------------- #
+//  VU-mètre                                                                   #
+// --------------------------------------------------------------------------- #
+
 let startedAt = Date()
 var micDisplay: Float = 0
 var systemDisplay: Float = 0
@@ -131,49 +175,43 @@ func meter(_ level: Float) -> String {
 }
 
 func refreshMeter() {
-    let mic = micPeak, system = systemPeak
-    micPeak = 0
-    systemPeak = 0
+    let mic = levels.mic, system = levels.system
+    levels.mic = 0
+    levels.system = 0
     if mic > 0.003 { micEverHeard = true }
     if system > 0.003 { systemEverHeard = true }
-    // retombée progressive, sinon la barre clignote sur chaque syllabe
     micDisplay = max(mic, micDisplay * 0.75)
     systemDisplay = max(system, systemDisplay * 0.75)
-    guard interactive else { return } // sortie redirigée : on suit les niveaux sans afficher
+    guard interactive else { return }
     let elapsed = Int(Date().timeIntervalSince(startedAt))
     let clock = String(format: "%02d:%02d", elapsed / 60, elapsed % 60)
     print("\r  \(clock)   Moi \(meter(micDisplay))   Eux \(meter(systemDisplay))  ", terminator: "")
     fflush(stdout)
 }
 
-let interactive = isatty(STDOUT_FILENO) == 1
 print("syscap: enregistrement en cours (Ctrl-C pour arrêter)")
 Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in refreshMeter() }
 
-// --- Arrêt propre : stopper les captures PUIS fermer les fichiers (le header WAV
-// n'est finalisé qu'à la libération des AVAudioFile)
+// --------------------------------------------------------------------------- #
+//  Arrêt propre                                                               #
+// --------------------------------------------------------------------------- #
+
 func shutdown() {
     engine.inputNode.removeTap(onBus: 0)
     engine.stop()
-    if let ioProcID {
-        AudioDeviceStop(aggID, ioProcID)
-        AudioDeviceDestroyIOProcID(aggID, ioProcID)
-    }
-    AudioHardwareDestroyAggregateDevice(aggID)
-    AudioHardwareDestroyProcessTap(tapID)
-    usleep(100_000) // laisse finir les derniers callbacks avant de fermer les fichiers
-    systemFile = nil
+    scStream?.stopCapture { _ in }
+    usleep(200_000) // laisse finir les derniers buffers avant de fermer les fichiers
+    systemCapture.close()
     micFile = nil
-    if interactive { print("") } // laisse la ligne du VU-mètre intacte
+    if interactive { print("") }
     if !micEverHeard {
         print("syscap: ⚠️  aucun son capté sur le micro")
         print("         → Réglages Système > Confidentialité et sécurité > Microphone : autoriser votre terminal")
     }
     if !systemEverHeard {
-        print("syscap: ⚠️  aucun son capté sur l'audio système (le tap ne renvoie que du silence)")
-        print("         → Réglages Système > Confidentialité et sécurité > Enregistrement audio : autoriser votre terminal")
-        print("         macOS livre du silence sans erreur quand la permission manque.")
-        print("         Le prompt n'apparaît que depuis un terminal interactif (Terminal.app, iTerm…).")
+        print("syscap: ⚠️  aucun son capté sur l'audio système")
+        print("         → Réglages Système > Confidentialité et sécurité > Enregistrement de l'écran")
+        print("           et de l'audio système : autoriser votre terminal, puis relancer.")
     }
     print("syscap: arrêt, fichiers écrits")
     exit(0)
