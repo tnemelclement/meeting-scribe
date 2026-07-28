@@ -23,6 +23,9 @@ guard args.count == 3 else { fail("usage: syscap <system.wav> <mic.wav>") }
 let systemURL = URL(fileURLWithPath: args[1])
 let micURL = URL(fileURLWithPath: args[2])
 let interactive = isatty(STDOUT_FILENO) == 1
+// Mode « données » : émet « mic sys » à 10 Hz sur stdout au lieu du VU-mètre,
+// pour qu'un pilote (scribe) affiche sa propre interface.
+let rawMode = ProcessInfo.processInfo.environment["SYSCAP_RAW"] != nil
 
 /// Amplitude crête d'un buffer, pour le VU-mètre.
 func peak(of buffer: AVAudioPCMBuffer) -> Float {
@@ -180,6 +183,11 @@ func refreshMeter() {
     levels.system = 0
     if mic > 0.003 { micEverHeard = true }
     if system > 0.003 { systemEverHeard = true }
+    if rawMode {
+        print(String(format: "%.4f %.4f", mic, system))
+        fflush(stdout)
+        return
+    }
     micDisplay = max(mic, micDisplay * 0.75)
     systemDisplay = max(system, systemDisplay * 0.75)
     guard interactive else { return }
@@ -203,17 +211,18 @@ func shutdown() {
     usleep(200_000) // laisse finir les derniers buffers avant de fermer les fichiers
     systemCapture.close()
     micFile = nil
-    if interactive { print("") }
+    if interactive && !rawMode { print("") }
+    func warn(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
     if !micEverHeard {
-        print("syscap: ⚠️  aucun son capté sur le micro")
-        print("         → Réglages Système > Confidentialité et sécurité > Microphone : autoriser votre terminal")
+        warn("syscap: ⚠️  aucun son capté sur le micro")
+        warn("         → Réglages Système > Confidentialité et sécurité > Microphone : autoriser votre terminal")
     }
     if !systemEverHeard {
-        print("syscap: ⚠️  aucun son capté sur l'audio système")
-        print("         → Réglages Système > Confidentialité et sécurité > Enregistrement de l'écran")
-        print("           et de l'audio système : autoriser votre terminal, puis relancer.")
+        warn("syscap: ⚠️  aucun son capté sur l'audio système")
+        warn("         → Réglages Système > Confidentialité et sécurité > Enregistrement de l'écran")
+        warn("           et de l'audio système : autoriser votre terminal, puis relancer.")
     }
-    print("syscap: arrêt, fichiers écrits")
+    warn("syscap: arrêt, fichiers écrits")
     exit(0)
 }
 

@@ -37,11 +37,12 @@ Cochez votre terminal (Terminal, iTerm…), **quittez-le et relancez-le**, puis 
 
 ## Usage
 
-Pendant l'enregistrement, un VU-mètre confirme que les deux pistes captent :
+Dans un terminal, `scribe` affiche une **interface plein écran** (curses, sans dépendance) :
 
-```
-  02:34   Moi ███████·············   Eux ██████████··········
-```
+- **Enregistrement** : horloge, indicateur `● REC`, et deux VU-mètres (Moi / Eux) qui confirment en direct que les pistes captent. On arrête avec `s` (ou Ctrl-C).
+- **Transcription** : choix du moteur (local / API) puis deux barres de progression.
+
+L'interface se désactive avec `--no-ui`, ou automatiquement quand la sortie est redirigée (on retombe alors sur un affichage ligne par ligne).
 
 ```sh
 ./scribe                          # enregistre, Ctrl-C pour arrêter → transcrit → écrit le .md
@@ -50,6 +51,7 @@ Pendant l'enregistrement, un VU-mètre confirme que les deux pistes captent :
 ./scribe --backend local          # moteur : local | api | ask (défaut : demande à l'arrêt)
 ./scribe --model tiny             # modèle whisper local (défaut : large-v3-turbo, téléchargé au 1er usage)
 ./scribe --redo <dossier>         # re-transcrit une session déjà enregistrée
+./scribe --no-ui                  # désactive l'interface plein écran
 ```
 
 ### Choix du moteur de transcription

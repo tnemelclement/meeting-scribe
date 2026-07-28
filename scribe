@@ -12,13 +12,16 @@ Usage :
 """
 
 import argparse
+import curses
 import datetime
 import json
+import math
 import os
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -247,6 +250,225 @@ def choose_backend(requested: str) -> str:
     return "local"  # non interactif : local par défaut
 
 
+def transcribe_all(session: Path, backend: str, lang: str, model_name: str,
+                   progress: Progress) -> tuple[list[dict], list[dict]]:
+    """Transcrit les deux pistes. Eux occupe [0, 0.5] de la barre, Moi [0.5, 1]."""
+    model = ensure_model(model_name) if backend == "local" else None
+    progress.label = "Eux"
+    if backend == "api":
+        theirs = transcribe_api(session / "system.wav", lang, progress, 0.0, 0.5)
+    else:
+        theirs = transcribe_local(session / "system.wav", model, lang, progress, 0.0, 0.5)
+    progress.label = "Moi"
+    if backend == "api":
+        mine = transcribe_api(session / "mic.wav", lang, progress, 0.5, 0.5)
+    else:
+        mine = transcribe_local(session / "mic.wav", model, lang, progress, 0.5, 0.5)
+    return mine, theirs
+
+
+# --------------------------------------------------------------------------- #
+#  Interface plein écran (curses, stdlib)                                      #
+# --------------------------------------------------------------------------- #
+
+class UIProgress:
+    """Interface Progress qui écrit dans un état partagé lu par la boucle de dessin."""
+
+    def __init__(self, state: dict):
+        self.state = state
+        self.label = ""
+
+    def bar(self, fraction: float) -> None:
+        self.state["frac"] = max(0.0, min(1.0, fraction))
+        self.state["active"] = self.label
+        self.state["spin"] = False
+
+    def spin(self, base: float, span: float, tick: int) -> None:
+        self.state["frac"] = base
+        self.state["active"] = self.label
+        self.state["spin"] = True
+
+    def done(self) -> None:
+        pass
+
+
+def _bar(level: float, width: int) -> str:
+    """Barre pleine proportionnelle à un niveau 0..1 (échelle dB pour l'audio)."""
+    filled = int(max(0.0, min(1.0, level)) * width)
+    return "█" * filled + "·" * (width - filled)
+
+
+def _db_level(peak: float) -> float:
+    """Niveau audio 0..1 sur une échelle dB (-60 dB → 0, 0 dB → 1)."""
+    if peak <= 0.0001:
+        return 0.0
+    return max(0.0, (20 * math.log10(peak) + 60) / 60)
+
+
+def run_ui(scr, session: Path, args, stamp, result: dict) -> None:
+    curses.curs_set(0)
+    scr.nodelay(True)
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_RED, -1)
+        curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+    CYAN, GREEN, YELLOW, RED, MAGENTA = (curses.color_pair(i) for i in range(1, 6))
+
+    def put(y, x, text, attr=0):
+        try:
+            scr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+
+    def frame(title):
+        scr.erase()
+        h, w = scr.getmaxyx()
+        put(0, 0, "─" * w, CYAN)
+        put(0, 2, f" meeting-scribe · {title} ", CYAN | curses.A_BOLD)
+        put(h - 1, 0, "─" * w, CYAN)
+        return h, w
+
+    def meter_row(y, w, label, level, ever, color):
+        put(y, 4, label, curses.A_BOLD)
+        bar_w = max(10, w - 22)
+        put(y, 9, "[", CYAN)
+        put(y, 10, _bar(level, bar_w), color)
+        put(y, 10 + bar_w, "]", CYAN)
+        mark = "●" if ever else "○"
+        put(y, 13 + bar_w, mark, GREEN if ever else 0)
+
+    # ---- Phase 1 : enregistrement (sauf --redo) ----
+    if not args.redo:
+        session.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, "SYSCAP_RAW": "1"}
+        proc = subprocess.Popen(
+            [str(SYSCAP), str(session / "system.wav"), str(session / "mic.wav")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        lv = {"mic": 0.0, "sys": 0.0, "mic_disp": 0.0, "sys_disp": 0.0,
+              "mic_ever": False, "sys_ever": False}
+
+        def reader():
+            for line in proc.stdout:
+                try:
+                    m, s = (float(x) for x in line.split())
+                except ValueError:
+                    continue
+                lv["mic"], lv["sys"] = m, s
+                if m > 0.01:
+                    lv["mic_ever"] = True
+                if s > 0.01:
+                    lv["sys_ever"] = True
+        threading.Thread(target=reader, daemon=True).start()
+
+        started = time.time()
+        stopped = False
+        while not stopped:
+            if proc.poll() is not None:
+                break
+            lv["mic_disp"] = max(_db_level(lv["mic"]), lv["mic_disp"] * 0.7)
+            lv["sys_disp"] = max(_db_level(lv["sys"]), lv["sys_disp"] * 0.7)
+            lv["mic"] = lv["sys"] = 0.0
+
+            h, w = frame("enregistrement")
+            elapsed = int(time.time() - started)
+            dot = "●" if int(time.time() * 2) % 2 else " "  # clignote
+            put(2, 4, f"{dot} REC", RED | curses.A_BOLD)
+            put(2, w - 14, f"{elapsed // 60:02d}:{elapsed % 60:02d}", curses.A_BOLD)
+            put(4, 4, args.title, MAGENTA)
+            meter_row(6, w, "Moi", lv["mic_disp"], lv["mic_ever"], GREEN)
+            meter_row(8, w, "Eux", lv["sys_disp"], lv["sys_ever"], GREEN)
+            if not lv["sys_ever"] and elapsed > 3:
+                put(10, 4, "⚠  aucun son système — permission « Enregistrement de l'écran » ?", YELLOW)
+            put(h - 3, 4, "[s] arrêter et transcrire     [Ctrl-C] arrêter", CYAN)
+            scr.refresh()
+
+            try:
+                key = scr.getch()
+            except KeyboardInterrupt:
+                key = 3
+            if key in (ord("s"), ord("S"), ord("\n"), ord(" "), 3, 27):
+                stopped = True
+            time.sleep(0.08)
+
+        proc.send_signal(signal.SIGINT)
+        proc.wait()
+
+    # ---- Phase 2 : choix du backend ----
+    backend = args.backend
+    if backend == "ask":
+        scr.nodelay(False)
+        while True:
+            h, w = frame("transcription")
+            put(3, 4, "Comment transcrire ?", curses.A_BOLD)
+            put(5, 6, "[L]  local  — whisper.cpp, gratuit, hors-ligne, privé", GREEN)
+            put(6, 6, "[A]  api    — OpenAI Whisper, ~0,72 $/h, plus rapide", YELLOW)
+            put(8, 4, "Votre choix (L/A) :", CYAN)
+            scr.refresh()
+            key = scr.getch()
+            if key in (ord("a"), ord("A")):
+                backend = "api"
+                break
+            if key in (ord("l"), ord("L"), ord("\n")):
+                backend = "local"
+                break
+        scr.nodelay(True)
+
+    # ---- Phase 3 : transcription (thread worker + dessin) ----
+    state = {"frac": 0.0, "active": "Eux", "spin": False, "done": False, "error": None}
+
+    def worker():
+        try:
+            progress = UIProgress(state)
+            mine, theirs = transcribe_all(session, backend, args.lang, args.model, progress)
+            result["mine"], result["theirs"] = mine, theirs
+        except SystemExit as e:
+            state["error"] = str(e)
+        except Exception as e:  # noqa: BLE001
+            state["error"] = repr(e)
+        finally:
+            state["done"] = True
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    tick = 0
+    while not state["done"]:
+        tick += 1
+        h, w = frame("transcription")
+        put(2, 4, f"Transcription ({backend})", curses.A_BOLD)
+        bar_w = max(10, w - 24)
+        frac = state["frac"]
+        for i, (name, lo) in enumerate((("Eux", 0.0), ("Moi", 0.5))):
+            fill = max(0.0, min(1.0, (frac - lo) / 0.5))
+            y = 5 + i * 2
+            active = state["active"] == name and not state["done"]
+            put(y, 4, name, curses.A_BOLD if active else 0)
+            put(y, 9, "[", CYAN)
+            if active and state["spin"]:  # API : marquee
+                cells = ["·"] * bar_w
+                cells[tick % bar_w] = "█"
+                put(y, 10, "".join(cells), YELLOW)
+            else:
+                put(y, 10, _bar(fill, bar_w), GREEN)
+            put(y, 10 + bar_w, "]", CYAN)
+            put(y, 13 + bar_w, f"{int(fill * 100):3d}%")
+        put(h - 3, 4, "Transcription en cours…", CYAN)
+        scr.refresh()
+        try:
+            scr.getch()
+        except KeyboardInterrupt:
+            pass
+        time.sleep(0.1)
+
+    result["backend"] = backend
+    if state["error"]:
+        result["error"] = state["error"]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="scribe", description=__doc__)
     parser.add_argument("--title", default="reunion")
@@ -254,6 +476,7 @@ def main() -> None:
     parser.add_argument("--backend", choices=["local", "api", "ask"], default="ask")
     parser.add_argument("--model", default="large-v3-turbo")
     parser.add_argument("--redo", metavar="DOSSIER", help="re-transcrit une session existante")
+    parser.add_argument("--no-ui", action="store_true", help="désactive l'interface plein écran")
     args = parser.parse_args()
 
     if not WHISPER_CPP.exists():
@@ -268,25 +491,22 @@ def main() -> None:
             die(f"pas de system.wav dans {session}")
     else:
         session = SESSIONS_DIR / f"{stamp:%Y-%m-%d_%H%M%S}"
-        record(session)
 
-    backend = choose_backend(args.backend)
-    progress = Progress(interactive=sys.stdout.isatty())
+    use_ui = not args.no_ui and sys.stdout.isatty() and sys.stdin.isatty()
 
-    # Les deux pistes se partagent la barre à parts égales : Eux [0, 0.5], Moi [0.5, 1]
-    progress.label = "Eux"
-    if backend == "api":
-        theirs = transcribe_api(session / "system.wav", args.lang, progress, 0.0, 0.5)
+    if use_ui:
+        result: dict = {}
+        curses.wrapper(run_ui, session, args, stamp, result)
+        if result.get("error"):
+            die(result["error"].replace("scribe: ", ""))
+        backend, mine, theirs = result["backend"], result["mine"], result["theirs"]
     else:
-        model = ensure_model(args.model)
-        theirs = transcribe_local(session / "system.wav", model, args.lang, progress, 0.0, 0.5)
-
-    progress.label = "Moi"
-    if backend == "api":
-        mine = transcribe_api(session / "mic.wav", args.lang, progress, 0.5, 0.5)
-    else:
-        mine = transcribe_local(session / "mic.wav", model, args.lang, progress, 0.5, 0.5)
-    progress.done()
+        if not args.redo:
+            record(session)
+        backend = choose_backend(args.backend)
+        progress = Progress(interactive=sys.stdout.isatty())
+        mine, theirs = transcribe_all(session, backend, args.lang, args.model, progress)
+        progress.done()
 
     out = write_markdown(session, args.title, stamp, backend, mine, theirs)
     print(f"scribe: transcription écrite → {out}")
