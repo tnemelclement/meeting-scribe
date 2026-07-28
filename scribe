@@ -29,6 +29,8 @@ WHISPER_API_CLI = Path("/Library/Frameworks/Python.framework/Versions/3.11/bin/w
 API_ENV_FILE = Path.home() / "dev" / "whisper-cli" / ".env"  # source de la clé OpenAI
 MODEL_DIR = Path.home() / ".cache" / "whisper-cpp"
 MODEL_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+VAD_MODEL = "silero-v5.1.2"
+VAD_MODEL_URL = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
 SESSIONS_DIR = Path(os.environ.get("SCRIBE_SESSIONS", Path.home() / "Music" / "scribe"))
 OUT_DIR = Path(os.environ.get(
     "SCRIBE_OUT",
@@ -94,6 +96,18 @@ def ensure_model(name: str) -> Path:
     return model
 
 
+def ensure_vad_model() -> Path:
+    model = MODEL_DIR / f"ggml-{VAD_MODEL}.bin"
+    if model.exists():
+        return model
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    print("scribe: téléchargement du modèle VAD (Silero)…")
+    tmp = model.with_suffix(".part")
+    subprocess.run(["curl", "-L", "--fail", "--progress-bar", "-o", str(tmp), VAD_MODEL_URL], check=True)
+    tmp.rename(model)
+    return model
+
+
 def resample_16k(wav: Path) -> Path:
     """16 kHz mono 16 bits : requis par whisper.cpp, et réduit fortement l'upload API."""
     out = wav.with_name(wav.stem + "-16k.wav")
@@ -111,9 +125,14 @@ def resample_16k(wav: Path) -> Path:
 def transcribe_local(wav: Path, model: Path, lang: str,
                      progress: Progress, base: float, span: float) -> list[dict]:
     wav16k = resample_16k(wav)
+    vad_model = ensure_vad_model()
     out_prefix = wav.with_suffix("")
+    # Chaque piste est silencieuse quand l'autre parle → Whisper hallucine en boucle
+    # sur le silence. VAD (saute le silence) + max-context 0 (coupe le report de
+    # contexte qui enferme dans une répétition) + suppression des tokens non-vocaux.
     proc = subprocess.Popen(
         [str(WHISPER_CPP), "-m", str(model), "-l", lang, "-oj", "-of", str(out_prefix),
+         "--vad", "--vad-model", str(vad_model), "-mc", "0", "-sns",
          "-pp", "-np", "-f", str(wav16k)],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
