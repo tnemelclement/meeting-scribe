@@ -8,7 +8,8 @@ Usage :
   scribe --lang auto        langue (défaut : fr)
   scribe --backend api      moteur : local (whisper.cpp, gratuit) | api (OpenAI) | ask (défaut)
   scribe --model tiny       modèle whisper local (défaut : large-v3-turbo)
-  scribe --redo <dossier>   re-transcrit une session déjà enregistrée
+  scribe --list             liste les anciens enregistrements
+  scribe --redo <n|last|chemin>  re-transcrit un ancien enregistrement
 """
 
 import argparse
@@ -203,6 +204,78 @@ def parse_srt(path: Path) -> list[dict]:
         if text:
             segments.append({"ms": ((h * 60 + mn) * 60 + s) * 1000 + ms, "text": text})
     return segments
+
+
+# --------------------------------------------------------------------------- #
+#  Anciens enregistrements                                                     #
+# --------------------------------------------------------------------------- #
+
+def list_sessions() -> list[Path]:
+    """Sessions (dossiers contenant system.wav), de la plus récente à la plus ancienne."""
+    if not SESSIONS_DIR.exists():
+        return []
+    sessions = [d for d in SESSIONS_DIR.iterdir() if (d / "system.wav").exists()]
+    return sorted(sessions, key=lambda d: d.name, reverse=True)
+
+
+def session_duration(session: Path) -> float:
+    for name in ("system-16k.wav", "system.wav"):
+        f = session / name
+        if f.exists():
+            out = subprocess.run(["afinfo", str(f)], capture_output=True, text=True).stdout
+            m = re.search(r"estimated duration:\s*([\d.]+)", out)
+            if m:
+                return float(m.group(1))
+    return 0.0
+
+
+def transcribed_sessions() -> set[str]:
+    """Noms de sessions déjà référencées par un .md de sortie."""
+    done = set()
+    if OUT_DIR.exists():
+        for md in OUT_DIR.glob("*.md"):
+            txt = md.read_text(errors="ignore")
+            for s in list_sessions():
+                if str(s) in txt:
+                    done.add(s.name)
+    return done
+
+
+def cmd_list() -> None:
+    sessions = list_sessions()
+    if not sessions:
+        print(f"scribe: aucun enregistrement dans {SESSIONS_DIR}")
+        return
+    done = transcribed_sessions()
+    print(f"Enregistrements dans {SESSIONS_DIR} :\n")
+    for i, s in enumerate(sessions, 1):
+        dur = session_duration(s)
+        try:
+            when = datetime.datetime.strptime(s.name, "%Y-%m-%d_%H%M%S").strftime("%d/%m/%Y %H:%M")
+        except ValueError:
+            when = s.name
+        mark = "✓ transcrit" if s.name in done else "· non transcrit"
+        print(f"  {i:2d}.  {when}   {int(dur // 60):02d}:{int(dur % 60):02d}   {mark}")
+    print("\n  Re-transcrire :  ./scribe --redo <n>   (ou --redo last, ou un chemin)")
+
+
+def resolve_redo(value: str) -> Path:
+    """`--redo` accepte un chemin, « last », ou un numéro de la liste --list."""
+    if value == "last":
+        sessions = list_sessions()
+        if not sessions:
+            die(f"aucun enregistrement dans {SESSIONS_DIR}")
+        return sessions[0]
+    if value.isdigit():
+        sessions = list_sessions()
+        idx = int(value)
+        if not 1 <= idx <= len(sessions):
+            die(f"numéro {idx} invalide (1..{len(sessions)}) — voir ./scribe --list")
+        return sessions[idx - 1]
+    session = Path(value).expanduser()
+    if not (session / "system.wav").exists():
+        die(f"pas de system.wav dans {session}")
+    return session
 
 
 # --------------------------------------------------------------------------- #
@@ -475,9 +548,15 @@ def main() -> None:
     parser.add_argument("--lang", default="fr")
     parser.add_argument("--backend", choices=["local", "api", "ask"], default="ask")
     parser.add_argument("--model", default="large-v3-turbo")
-    parser.add_argument("--redo", metavar="DOSSIER", help="re-transcrit une session existante")
+    parser.add_argument("--redo", metavar="N|last|CHEMIN",
+                        help="re-transcrit un ancien enregistrement (numéro de --list, « last », ou chemin)")
+    parser.add_argument("--list", action="store_true", help="liste les anciens enregistrements")
     parser.add_argument("--no-ui", action="store_true", help="désactive l'interface plein écran")
     args = parser.parse_args()
+
+    if args.list:
+        cmd_list()
+        return
 
     if not WHISPER_CPP.exists():
         die("whisper-cli (local) introuvable — brew install whisper-cpp")
@@ -486,9 +565,7 @@ def main() -> None:
 
     stamp = datetime.datetime.now()
     if args.redo:
-        session = Path(args.redo).expanduser()
-        if not (session / "system.wav").exists():
-            die(f"pas de system.wav dans {session}")
+        session = resolve_redo(args.redo)
     else:
         session = SESSIONS_DIR / f"{stamp:%Y-%m-%d_%H%M%S}"
 

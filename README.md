@@ -50,9 +50,14 @@ L'interface se désactive avec `--no-ui`, ou automatiquement quand la sortie est
 ./scribe --lang auto              # langue (défaut : fr)
 ./scribe --backend local          # moteur : local | api | ask (défaut : demande à l'arrêt)
 ./scribe --model tiny             # modèle whisper local (défaut : large-v3-turbo, téléchargé au 1er usage)
-./scribe --redo <dossier>         # re-transcrit une session déjà enregistrée
+./scribe --list                   # liste les anciens enregistrements (date, durée, transcrit ou non)
+./scribe --redo 2                 # re-transcrit l'enregistrement n°2 de la liste
+./scribe --redo last              # re-transcrit le dernier enregistrement
+./scribe --redo <dossier>         # …ou par chemin
 ./scribe --no-ui                  # désactive l'interface plein écran
 ```
+
+Les enregistrements sont conservés dans `~/Music/scribe/` (configurable via `SCRIBE_SESSIONS`). `--list` affiche leur date, durée, et s'ils ont déjà été transcrits ; `--redo` en re-transcrit un par numéro, par `last`, ou par chemin — pratique pour re-jouer un enregistrement avec l'autre moteur (local ↔ API) ou après une amélioration du pipeline.
 
 ### Choix du moteur de transcription
 
