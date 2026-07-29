@@ -189,6 +189,51 @@ def transcribe_api(wav: Path, lang: str,
     return parse_srt(srt)
 
 
+def _strip_inline_repeats(text: str) -> str:
+    """Effondre une phrase répétée en boucle dans un même segment (hallucination Whisper).
+    La boucle peut commencer après un fragment initial → on la cherche à n'importe quelle position."""
+    words = text.split()
+    low = [w.lower() for w in words]
+    n = len(words)
+    if n < 12:
+        return text
+    for p in range(2, n // 2 + 1):        # période du cycle répété
+        for start in range(0, n - 3 * p + 1):
+            reps, i = 1, start + p
+            while i + p <= n and low[i:i + p] == low[i - p:i]:
+                reps += 1
+                i += p
+            if reps >= 3:                 # bloc [start, i) = une phrase répétée ≥ 3×
+                return " ".join(words[:start + p] + words[i:])
+    return text
+
+
+def _toks(text: str) -> set:
+    return set(re.findall(r"[0-9a-zàâçéèêëîïôûùüÿñæœ]+", text.lower()))
+
+
+def _is_dup(a: set, b: set) -> bool:
+    if not a or not b:
+        return False
+    small = min(len(a), len(b))
+    if small <= 3:                        # segments courts (« Ouais ») : égalité stricte
+        return a == b
+    return len(a & b) / small > 0.85      # inclusion : gère « préfixe + même boucle »
+
+
+def collapse_loops(segments: list[dict]) -> list[dict]:
+    """Filet anti-boucle (tous backends) : nettoie les répétitions inline puis
+    supprime les segments quasi identiques consécutifs."""
+    out: list[dict] = []
+    for seg in segments:
+        text = _strip_inline_repeats(seg["text"])
+        tk = _toks(text)
+        if any(_is_dup(tk, _toks(o["text"])) for o in out[-2:]):
+            continue
+        out.append({**seg, "text": text})
+    return out
+
+
 def parse_srt(path: Path) -> list[dict]:
     segments = []
     for block in path.read_text().strip().split("\n\n"):
@@ -297,7 +342,8 @@ def record(session: Path) -> None:
 def write_markdown(session: Path, title: str, stamp: datetime.datetime,
                    backend: str, mine: list[dict], theirs: list[dict]) -> Path:
     merged = sorted(
-        [{**s, "who": "Moi"} for s in mine] + [{**s, "who": "Eux"} for s in theirs],
+        [{**s, "who": "Moi"} for s in collapse_loops(mine)]
+        + [{**s, "who": "Eux"} for s in collapse_loops(theirs)],
         key=lambda s: s["ms"],
     )
     lines = [f"# Réunion — {title} ({stamp:%Y-%m-%d %H:%M})", ""]

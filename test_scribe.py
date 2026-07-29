@@ -29,6 +29,21 @@ def test_parse_srt():
     ], segments
 
 
+def test_collapse_loops():
+    phrase = "il y a plein d'ingénieurs qui travaillent sur le risque"
+    segments = [
+        {"ms": 0, "text": "Bonjour, on commence la réunion."},
+        {"ms": 1000, "text": (phrase + ", ") * 10},          # boucle inline
+        {"ms": 2000, "text": "c'est vrai qu' " + (phrase + ", ") * 8},  # même boucle, segment suivant
+        {"ms": 3000, "text": "Passons au point suivant."},
+    ]
+    out = scribe.collapse_loops(segments)
+    assert len(out) == 3, out                     # la 2e boucle (dup) supprimée
+    assert out[1]["text"].count("ingénieurs") == 1, out[1]  # inline effondré à 1 copie
+    assert out[2]["text"] == "Passons au point suivant.", out
+
+
 if __name__ == "__main__":
     test_parse_srt()
+    test_collapse_loops()
     print("ok")
