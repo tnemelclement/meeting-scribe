@@ -152,12 +152,31 @@ if ready.wait(timeout: .now() + 10) == .timedOut {
 // --------------------------------------------------------------------------- #
 
 let engine = AVAudioEngine()
-let micFormat = engine.inputNode.outputFormat(forBus: 0)
-var micFile: AVAudioFile? = try? AVAudioFile(forWriting: micURL, settings: micFormat.settings)
+let micHW = engine.inputNode.outputFormat(forBus: 0)  // format matériel (typiquement 48 kHz float)
+// Cible 16 kHz mono Int16 : prêt pour whisper, ~20× plus léger que le brut 48 kHz float
+guard let micTarget = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
+                                    channels: 1, interleaved: true),
+      let micConverter = AVAudioConverter(from: micHW, to: micTarget) else {
+    fail("initialisation du convertisseur micro (format \(micHW))")
+}
+// commonFormat/interleaved doivent matcher le buffer converti, sinon write() échoue en silence
+var micFile: AVAudioFile? = try? AVAudioFile(
+    forWriting: micURL, settings: micTarget.settings,
+    commonFormat: micTarget.commonFormat, interleaved: micTarget.isInterleaved)
 guard micFile != nil else { fail("impossible de créer \(micURL.path)") }
-engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { buffer, _ in
+let micRatio = micTarget.sampleRate / micHW.sampleRate
+engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: micHW) { buffer, _ in
     levels.mic = max(levels.mic, peak(of: buffer))
-    try? micFile?.write(from: buffer)
+    let capacity = AVAudioFrameCount(Double(buffer.frameLength) * micRatio) + 16
+    guard let out = AVAudioPCMBuffer(pcmFormat: micTarget, frameCapacity: capacity) else { return }
+    var supplied = false
+    micConverter.convert(to: out, error: nil) { _, status in
+        if supplied { status.pointee = .noDataNow; return nil }
+        supplied = true
+        status.pointee = .haveData
+        return buffer
+    }
+    if out.frameLength > 0 { try? micFile?.write(from: out) }
 }
 do { try engine.start() } catch { fail("démarrage du micro : \(error.localizedDescription)") }
 

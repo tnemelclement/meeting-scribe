@@ -84,7 +84,7 @@ Variables d'environnement :
 
 ## Comment ça marche
 
-1. `syscap` (Swift) capte l'audio système via ScreenCaptureKit (16 kHz mono) et le micro via AVAudioEngine, et enregistre deux WAV : `system.wav` (les autres) et `mic.wav` (vous). Pas de driver, pas de BlackHole, pas de bot dans la réunion.
+1. `syscap` (Swift) capte l'audio système via ScreenCaptureKit et le micro via AVAudioEngine, tous deux en **16 kHz mono** (le micro est rééchantillonné à la volée par un `AVAudioConverter`), et enregistre deux WAV légers : `system.wav` (les autres) et `mic.wav` (vous). Pas de driver, pas de BlackHole, pas de bot dans la réunion.
 2. `scribe` (Python, stdlib uniquement) resample en 16 kHz mono avec `afconvert` (fourni par macOS), transcrit les deux pistes avec le moteur choisi (whisper.cpp local, ou l'API OpenAI via le CLI [whisper-cli](https://github.com/tnemelclement/whisper-cli)), fusionne les segments par timestamp et écrit le markdown.
 
 ## Limites connues
