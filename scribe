@@ -544,7 +544,7 @@ def run_ui(scr, session: Path, args, stamp, result: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="scribe", description=__doc__)
-    parser.add_argument("--title", default="reunion")
+    parser.add_argument("--title", default=None, help="titre (sinon demandé avant l'enregistrement)")
     parser.add_argument("--lang", default="fr")
     parser.add_argument("--backend", choices=["local", "api", "ask"], default="ask")
     parser.add_argument("--model", default="large-v3-turbo")
@@ -562,6 +562,15 @@ def main() -> None:
         die("whisper-cli (local) introuvable — brew install whisper-cpp")
     if not SYSCAP.exists() and not args.redo:
         die("syscap non compilé — lancer : swift build -c release")
+
+    # Titre : demandé avant l'enregistrement s'il n'est pas fourni
+    if args.title:
+        args.title = re.sub(r"\s+", "-", args.title.strip())
+    elif sys.stdin.isatty():
+        entered = input("Titre de la réunion : ").strip()
+        args.title = re.sub(r"\s+", "-", entered) or "reunion"
+    else:
+        args.title = "reunion"
 
     stamp = datetime.datetime.now()
     if args.redo:

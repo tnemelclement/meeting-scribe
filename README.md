@@ -18,7 +18,10 @@ Fonctionne avec n'importe quelle plateforme (Zoom, Meet, Teams, Discord…) puis
 git clone git@github.com:tnemelclement/meeting-scribe.git
 cd meeting-scribe
 swift build -c release
+ln -s "$PWD/scribe" ~/.local/bin/scribe   # lancer `scribe` depuis n'importe où
 ```
+
+Le lien symbolique suit son vrai chemin, donc `scribe` retrouve toujours le binaire `syscap` compilé, où que vous soyez. (Assurez-vous que `~/.local/bin` est dans votre `PATH`.)
 
 ### Permissions (à faire une fois)
 
@@ -45,8 +48,8 @@ Dans un terminal, `scribe` affiche une **interface plein écran** (curses, sans 
 L'interface se désactive avec `--no-ui`, ou automatiquement quand la sortie est redirigée (on retombe alors sur un affichage ligne par ligne).
 
 ```sh
-./scribe                          # enregistre, Ctrl-C pour arrêter → transcrit → écrit le .md
-./scribe --title standup          # nom de la note
+./scribe                          # demande le titre, enregistre, [s] pour arrêter → transcrit → .md
+./scribe --title standup          # titre fourni → pas de question
 ./scribe --lang auto              # langue (défaut : fr)
 ./scribe --backend local          # moteur : local | api | ask (défaut : demande à l'arrêt)
 ./scribe --model tiny             # modèle whisper local (défaut : large-v3-turbo, téléchargé au 1er usage)
