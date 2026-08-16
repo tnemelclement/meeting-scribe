@@ -20,6 +20,7 @@ import math
 import os
 import re
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -112,8 +113,33 @@ def ensure_vad_model() -> Path:
     return model
 
 
+def repair_wav(wav: Path) -> None:
+    """Répare l'en-tête d'un WAV non finalisé (syscap interrompu brutalement) : les
+    tailles RIFF et `data` restent à 0 alors que l'audio est bien présent."""
+    size = wav.stat().st_size
+    with open(wav, "r+b") as f:
+        head = f.read(12)
+        if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+            return
+        off = 12
+        while off + 8 <= size:
+            f.seek(off)
+            cid = f.read(4)
+            csz = struct.unpack("<I", f.read(4))[0]
+            if cid == b"data":
+                real = size - (off + 8)
+                if csz != real:  # non finalisé → on écrit les vraies tailles
+                    f.seek(off + 4)
+                    f.write(struct.pack("<I", real))
+                    f.seek(4)
+                    f.write(struct.pack("<I", size - 8))
+                return
+            off += 8 + csz + (csz & 1)
+
+
 def resample_16k(wav: Path) -> Path:
     """16 kHz mono 16 bits : requis par whisper.cpp, et réduit fortement l'upload API."""
+    repair_wav(wav)  # récupère les enregistrements dont l'en-tête n'a pas été finalisé
     out = wav.with_name(wav.stem + "-16k.wav")
     subprocess.run(
         ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(wav), str(out)],
@@ -145,10 +171,13 @@ def transcribe_local(wav: Path, model: Path, lang: str,
         if m:
             progress.bar(base + span * int(m.group(1)) / 100)
     proc.wait()
-    if proc.returncode != 0:
-        die(f"whisper.cpp a échoué (code {proc.returncode})")
     progress.bar(base + span)
-    data = json.loads(out_prefix.with_suffix(".json").read_text())
+    json_path = out_prefix.with_suffix(".json")
+    if proc.returncode != 0 or not json_path.exists():
+        # audio vide/illisible : on n'a rien pour cette piste, mais on ne plante pas
+        sys.stderr.write(f"scribe: ⚠️  piste {wav.name} sans transcription (audio vide ou illisible)\n")
+        return []
+    data = json.loads(json_path.read_text())
     return [
         {"ms": seg["offsets"]["from"], "text": seg["text"].strip()}
         for seg in data.get("transcription", []) if seg["text"].strip()

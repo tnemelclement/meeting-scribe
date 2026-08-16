@@ -3,6 +3,7 @@ Lancer : python3 test_scribe.py
 """
 import importlib.util
 import tempfile
+import wave
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -43,7 +44,25 @@ def test_collapse_loops():
     assert out[2]["text"] == "Passons au point suivant.", out
 
 
+def test_repair_wav():
+    import struct
+    # WAV int16 mono 16k avec en-tête non finalisé (tailles RIFF et data à 0)
+    pcm = b"\x01\x02" * 8000  # 16000 octets de données
+    header = (b"RIFF" + struct.pack("<I", 0) + b"WAVE"
+              + b"fmt " + struct.pack("<I", 16)
+              + struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16)
+              + b"data" + struct.pack("<I", 0))
+    with tempfile.NamedTemporaryFile("wb", suffix=".wav", delete=False) as f:
+        f.write(header + pcm)
+        path = Path(f.name)
+    scribe.repair_wav(path)
+    with wave.open(str(path)) as w:
+        assert w.getframerate() == 16000 and w.getnframes() == 8000, (w.getframerate(), w.getnframes())
+    path.unlink()
+
+
 if __name__ == "__main__":
     test_parse_srt()
     test_collapse_loops()
+    test_repair_wav()
     print("ok")
