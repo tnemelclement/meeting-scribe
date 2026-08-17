@@ -152,33 +152,55 @@ if ready.wait(timeout: .now() + 10) == .timedOut {
 // --------------------------------------------------------------------------- #
 
 let engine = AVAudioEngine()
-let micHW = engine.inputNode.outputFormat(forBus: 0)  // format matériel (typiquement 48 kHz float)
 // Cible 16 kHz mono Int16 : prêt pour whisper, ~20× plus léger que le brut 48 kHz float
 guard let micTarget = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
-                                    channels: 1, interleaved: true),
-      let micConverter = AVAudioConverter(from: micHW, to: micTarget) else {
-    fail("initialisation du convertisseur micro (format \(micHW))")
+                                    channels: 1, interleaved: true) else {
+    fail("format cible micro invalide")
 }
 // commonFormat/interleaved doivent matcher le buffer converti, sinon write() échoue en silence
 var micFile: AVAudioFile? = try? AVAudioFile(
     forWriting: micURL, settings: micTarget.settings,
     commonFormat: micTarget.commonFormat, interleaved: micTarget.isInterleaved)
 guard micFile != nil else { fail("impossible de créer \(micURL.path)") }
-let micRatio = micTarget.sampleRate / micHW.sampleRate
-engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: micHW) { buffer, _ in
-    levels.mic = max(levels.mic, peak(of: buffer))
-    let capacity = AVAudioFrameCount(Double(buffer.frameLength) * micRatio) + 16
-    guard let out = AVAudioPCMBuffer(pcmFormat: micTarget, frameCapacity: capacity) else { return }
-    var supplied = false
-    micConverter.convert(to: out, error: nil) { _, status in
-        if supplied { status.pointee = .noDataNow; return nil }
-        supplied = true
-        status.pointee = .haveData
-        return buffer
+
+/// (Ré)installe le tap micro avec le format matériel courant. À rappeler après
+/// tout changement de route audio, car le format d'entrée peut avoir changé.
+func installMicTap() {
+    let hw = engine.inputNode.outputFormat(forBus: 0)
+    guard hw.sampleRate > 0, hw.channelCount > 0,        // format transitoire invalide
+          let converter = AVAudioConverter(from: hw, to: micTarget) else { return }
+    let ratio = micTarget.sampleRate / hw.sampleRate
+    engine.inputNode.removeTap(onBus: 0)
+    engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: hw) { buffer, _ in
+        levels.mic = max(levels.mic, peak(of: buffer))
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
+        guard let out = AVAudioPCMBuffer(pcmFormat: micTarget, frameCapacity: capacity) else { return }
+        var supplied = false
+        converter.convert(to: out, error: nil) { _, status in
+            if supplied { status.pointee = .noDataNow; return nil }
+            supplied = true
+            status.pointee = .haveData
+            return buffer
+        }
+        if out.frameLength > 0 { try? micFile?.write(from: out) }
     }
-    if out.frameLength > 0 { try? micFile?.write(from: out) }
 }
+
+/// Redémarre le micro s'il s'est arrêté (changement de route audio). Idempotent.
+func ensureMicRunning() {
+    guard !engine.isRunning else { return }
+    installMicTap()
+    try? engine.start()
+}
+
+installMicTap()
 do { try engine.start() } catch { fail("démarrage du micro : \(error.localizedDescription)") }
+
+// AVAudioEngine s'arrête et poste cette notif quand la route audio change (casque
+// branché/débranché, Bluetooth, changement de périphérique). Sans réaction, le micro
+// reste coupé jusqu'à la fin — c'est ce qui tronquait la piste « Moi ».
+NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+                                       object: engine, queue: .main) { _ in ensureMicRunning() }
 
 // --------------------------------------------------------------------------- #
 //  VU-mètre                                                                   #
@@ -197,6 +219,7 @@ func meter(_ level: Float) -> String {
 }
 
 func refreshMeter() {
+    ensureMicRunning()  // filet : relance le micro s'il s'est arrêté, quelle qu'en soit la cause
     let mic = levels.mic, system = levels.system
     levels.mic = 0
     levels.system = 0
