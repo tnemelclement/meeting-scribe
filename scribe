@@ -29,7 +29,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
 SYSCAP = REPO / ".build" / "release" / "syscap"
-WHISPER_CPP = Path("/opt/homebrew/opt/whisper-cpp/bin/whisper-cli")  # transcription locale (Metal)
+# transcription locale (Metal) ; la formule s'appelle whisper.cpp, whisper-cpp sur les anciennes installs
+WHISPER_CPP = next((p for p in (Path(f"/opt/homebrew/opt/{f}/bin/whisper-cli") for f in ("whisper.cpp", "whisper-cpp")) if p.exists()),
+                   Path("/opt/homebrew/opt/whisper.cpp/bin/whisper-cli"))
 WHISPER_API_CLI = Path("/Library/Frameworks/Python.framework/Versions/3.11/bin/whisper-cli")  # backend API OpenAI
 API_ENV_FILE = Path.home() / "dev" / "whisper-cli" / ".env"  # source de la clé OpenAI
 MODEL_DIR = Path.home() / ".cache" / "whisper-cpp"
@@ -634,7 +636,7 @@ def main() -> None:
         return
 
     if not WHISPER_CPP.exists():
-        die("whisper-cli (local) introuvable — brew install whisper-cpp")
+        die("whisper-cli (local) introuvable — brew install whisper.cpp")
     if not SYSCAP.exists() and not args.redo:
         die("syscap non compilé — lancer : swift build -c release")
 
