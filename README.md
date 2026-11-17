@@ -1,3 +1,5 @@
+> **Archivé** : porté en Swift dans l'app NextMeeting de [mac-tools](https://github.com/tnemelclement/mac-tools) (enregistrement et transcription depuis la barre de menus).
+
 # meeting-scribe
 
 Transcription de réunions **100 % locale** sur macOS, sans bot dans la réunion.
